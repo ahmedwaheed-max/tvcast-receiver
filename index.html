@@ -1,0 +1,414 @@
+<!doctype html>
+<!--
+  TV Cast — the screen that shows the phone's mirrored screen. One page, two ways in:
+
+  * Cast mode (served over HTTPS, as a Google Cast Custom Web Receiver on a Chromecast /
+    Google TV). Signaling travels on the Cast custom message channel NAMESPACE below — keep it
+    identical to CastOptionsProvider.MIRROR_NAMESPACE in the Android app. Setup: ../README.md.
+  * Browser mode (served by the phone itself over plain HTTP on the Wi-Fi, opened in Chrome /
+    Edge / Safari on a computer or a smart TV's browser). Signaling travels on a WebSocket back
+    to the phone (/ws). The app bundles this folder as its assets (BrowserReceiver.kt).
+
+  Either way the picture is WebRTC, peer-to-peer on the local network. `?mode=cast|browser`
+  overrides the detection (testing).
+
+  Media mode (Videos / Photos / Music in the app): a `media` message names a file the phone
+  serves itself (`/media/<token>`, with ranges); this page shows it full screen — video, photo,
+  or a song's cover art and title — follows `media-control` (play / pause / seek) and reports
+  `media-status` back every second, so the phone's timeline and timer follow the TV.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TV Cast</title>
+  <link rel="icon" href="logo.png">
+  <style>
+    html, body { margin: 0; height: 100%; background: #060606; overflow: hidden; font-family: "DM Sans", Roboto, "Segoe UI", Arial, sans-serif; color: #fff; }
+    #screen { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #000; display: none; }
+    body.streaming #screen { display: block; }
+    body.streaming #idle { display: none; }
+    #idle {
+      position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
+      padding: 0 24px; text-align: center;
+      background: radial-gradient(circle at 70% 25%, #2a1510 0%, #060606 60%);
+    }
+    #idle img { width: clamp(72px, 9vw, 160px); border-radius: 18%; }
+    #idle h1 { margin: 3vh 0 1vh; font-size: clamp(28px, 4.2vw, 72px); font-weight: 700; letter-spacing: .01em; }
+    #status { margin: 0; font-size: clamp(17px, 2vw, 36px); color: #cfcfcf; }
+    #hint { margin: 1.4vh 0 0; font-size: clamp(14px, 1.4vw, 26px); color: #8a8a8a; max-width: 40em; }
+    .dot { display: inline-block; width: .6em; height: .6em; border-radius: 50%; background: #5ed35e; margin-right: .5em; vertical-align: middle; }
+    body.connecting .dot { background: #d74418; animation: pulse 1s infinite alternate; }
+    body.offline .dot { background: #8a8a8a; }
+    @keyframes pulse { from { opacity: .35; } to { opacity: 1; } }
+
+    body.browser { cursor: pointer; }
+    /* Browser mode only: sound and full-screen controls over the picture. */
+    #controls { position: fixed; right: 20px; bottom: 20px; display: none; gap: 10px; transition: opacity .3s; }
+    body.browser.streaming #controls { display: flex; }
+    body.idle-mouse #controls { opacity: 0; }
+    body.idle-mouse.streaming { cursor: none; }
+    #controls button {
+      font: inherit; font-size: 15px; color: #fff; background: rgba(21, 21, 21, .85); border: 1px solid #2a2a2a;
+      border-radius: 999px; padding: 10px 18px; cursor: pointer;
+    }
+    #controls button:hover { border-color: #d74418; }
+    /* Muted with sound available (the browser blocked autoplay): say so plainly, and never fade. */
+    #sound {
+      position: fixed; top: 20px; left: 50%; transform: translateX(-50%); z-index: 2;
+      font: inherit; font-size: 17px; font-weight: 600; color: #fff; background: #d74418; border: 0;
+      border-radius: 999px; padding: 12px 22px; cursor: pointer; box-shadow: 0 6px 24px rgba(0, 0, 0, .5);
+    }
+    body:not(.streaming):not(.media) #sound, #sound[hidden] { display: none; }
+
+    /* Media mode: one full-screen layer for a video, a photo, or a song's cover and title. */
+    #media { position: fixed; inset: 0; background: #000; display: none; }
+    body.media #media { display: block; }
+    body.media #idle { display: none; }
+    #media-video, #media-image { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; display: none; }
+    body.media-video #media-video, body.media-image #media-image { display: block; }
+    #media-audio {
+      position: absolute; inset: 0; display: none; flex-direction: column; align-items: center; justify-content: center; gap: 3vh;
+      background: radial-gradient(circle at 70% 25%, #2a1510 0%, #060606 65%);
+    }
+    body.media-audio #media-audio { display: flex; }
+    #media-art { width: min(42vh, 60vw); aspect-ratio: 1; border-radius: 8%; object-fit: cover; background: #2a1610; box-shadow: 0 2vh 6vh rgba(0, 0, 0, .6); }
+    #media-title { margin: 0; font-size: clamp(22px, 3.4vw, 64px); font-weight: 700; text-align: center; padding: 0 5vw; }
+    #media-artist { margin: -2vh 0 0; font-size: clamp(16px, 2vw, 36px); color: #9a9a9a; }
+  </style>
+</head>
+<body>
+  <div id="idle">
+    <img src="logo.png" alt="">
+    <h1>TV Cast</h1>
+    <p id="status"><span class="dot"></span><span id="status-text">Ready to mirror</span></p>
+    <p id="hint">On your phone, open TV Cast and tap Start Mirroring.</p>
+  </div>
+  <video id="screen" autoplay playsinline></video>
+  <div id="media">
+    <video id="media-video" playsinline></video>
+    <img id="media-image" alt="">
+    <div id="media-audio">
+      <img id="media-art" alt="">
+      <p id="media-title"></p>
+      <p id="media-artist"></p>
+    </div>
+  </div>
+  <button id="sound" hidden>&#128263; Sound is off · click anywhere to turn it on</button>
+  <div id="controls">
+    <button id="fullscreen">Full screen</button>
+  </div>
+
+  <script>
+    'use strict';
+
+    const NAMESPACE = 'urn:x-cast:tvcast.mirror';
+    const CAF_URL = 'https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js';
+    const MODE = new URLSearchParams(location.search).get('mode') || (location.protocol === 'https:' ? 'cast' : 'browser');
+
+    const video = document.getElementById('screen');
+    const statusText = document.getElementById('status-text');
+    const hint = document.getElementById('hint');
+    const soundButton = document.getElementById('sound');
+
+    /** How this page reaches the phone: set by startCast() or startBrowser(). */
+    let send = () => {};
+    let idleText = { status: 'Ready to mirror', hint: 'On your phone, open TV Cast and tap Start Mirroring.' };
+
+    /** One peer connection at a time; a new offer replaces whatever was there. */
+    let peer = null;
+    let pendingCandidates = [];
+
+    function show(state, text, hintText) {
+      document.body.className = [MODE, state].filter(Boolean).join(' ');
+      if (text) statusText.textContent = text;
+      if (hintText !== undefined) hint.textContent = hintText;
+    }
+
+    function showIdle() {
+      show('', idleText.status, idleText.hint);
+    }
+
+    function stopPeer() {
+      if (peer) {
+        peer.ontrack = peer.onicecandidate = peer.onconnectionstatechange = null;
+        peer.close();
+        peer = null;
+      }
+      pendingCandidates = [];
+      video.srcObject = null;
+      soundButton.hidden = true;
+      showIdle();
+    }
+
+    async function onOffer(sdp) {
+      // Candidates that beat this offer to the page belong to it: keep them through the reset.
+      const early = pendingCandidates;
+      stopPeer();
+      pendingCandidates = early;
+      show('connecting', 'Connecting…');
+      // Same Wi-Fi only: host candidates are enough, so no STUN/TURN servers.
+      peer = new RTCPeerConnection({ iceServers: [] });
+
+      peer.onicecandidate = (event) => {
+        if (!event.candidate) return;
+        send({ type: 'candidate', candidate: event.candidate.candidate, sdpMid: event.candidate.sdpMid, sdpMLineIndex: event.candidate.sdpMLineIndex });
+      };
+
+      peer.ontrack = (event) => {
+        // Mirroring wants the newest frame, not a smooth buffer: ask for minimal playout delay.
+        const receiver = event.receiver;
+        if ('jitterBufferTarget' in receiver) receiver.jitterBufferTarget = 0;
+        if ('playoutDelayHint' in receiver) receiver.playoutDelayHint = 0;
+        const stream = video.srcObject || new MediaStream();
+        stream.addTrack(event.track);
+        video.srcObject = stream;
+        play(event.track.kind === 'audio');
+        if (event.track.kind === 'video') show('streaming');
+      };
+
+      peer.onconnectionstatechange = () => {
+        if (!peer) return;
+        if (peer.connectionState === 'failed' || peer.connectionState === 'closed') stopPeer();
+      };
+
+      await peer.setRemoteDescription({ type: 'offer', sdp });
+      for (const candidate of pendingCandidates) await peer.addIceCandidate(candidate).catch(() => {});
+      pendingCandidates = [];
+      await peer.setLocalDescription(await peer.createAnswer());
+      send({ type: 'answer', sdp: peer.localDescription.sdp });
+    }
+
+    /** Plays with sound when the browser allows it; otherwise muted, with a button for sound. */
+    function play(hasAudio) {
+      video.muted = false;
+      video.play().catch(() => {
+        video.muted = true;
+        video.play().catch(() => {});
+        if (hasAudio || video.srcObject?.getAudioTracks().length) soundButton.hidden = false;
+      });
+    }
+
+    async function onCandidate(message) {
+      const candidate = { candidate: message.candidate, sdpMid: message.sdpMid, sdpMLineIndex: message.sdpMLineIndex };
+      if (!peer || !peer.remoteDescription) {
+        pendingCandidates.push(candidate);
+        return;
+      }
+      await peer.addIceCandidate(candidate).catch(() => {});
+    }
+
+    // ---- Media mode: a file the phone serves, played here. ----
+
+    const mediaVideo = document.getElementById('media-video');
+    const mediaImage = document.getElementById('media-image');
+    const mediaArt = document.getElementById('media-art');
+    const mediaTitle = document.getElementById('media-title');
+    const mediaArtist = document.getElementById('media-artist');
+    let mediaKind = null;
+    let mediaTimer = 0;
+
+    function mediaStatus(extra) {
+      if (!mediaKind) return;
+      const timed = mediaKind !== 'image';
+      send(Object.assign({
+        type: 'media-status',
+        playing: timed && !mediaVideo.paused && !mediaVideo.ended,
+        position: timed ? Math.round(mediaVideo.currentTime * 1000) : 0,
+        duration: timed && isFinite(mediaVideo.duration) ? Math.round(mediaVideo.duration * 1000) : 0,
+        ended: timed && mediaVideo.ended,
+        failed: false,
+      }, extra || {}));
+    }
+
+    function stopMedia() {
+      clearInterval(mediaTimer);
+      mediaKind = null;
+      mediaVideo.onerror = mediaImage.onerror = null;
+      mediaVideo.pause();
+      mediaVideo.removeAttribute('src');
+      mediaVideo.load();
+      mediaImage.removeAttribute('src');
+      soundButton.hidden = true;
+    }
+
+    function playMedia() {
+      mediaVideo.muted = false;
+      mediaVideo.play().catch(() => {
+        mediaVideo.muted = true;
+        mediaVideo.play().catch(() => {});
+        soundButton.hidden = false;
+      });
+    }
+
+    function onMedia(message) {
+      stopPeer();
+      stopMedia();
+      mediaKind = message.kind;
+      const failed = () => send({ type: 'media-status', failed: true });
+      if (mediaKind === 'image') {
+        mediaImage.onload = () => mediaStatus();
+        mediaImage.onerror = failed;
+        mediaImage.src = message.url;
+      } else {
+        mediaTitle.textContent = message.title || '';
+        mediaArtist.textContent = message.artist || '';
+        mediaArt.src = message.art || 'logo.png';
+        mediaVideo.onerror = failed;
+        mediaVideo.onloadedmetadata = () => {
+          if (message.start) mediaVideo.currentTime = message.start / 1000;
+          mediaStatus();
+        };
+        mediaVideo.onplay = mediaVideo.onpause = mediaVideo.onended = mediaVideo.onseeked = () => mediaStatus();
+        mediaVideo.src = message.url;
+        playMedia();
+        mediaTimer = setInterval(mediaStatus, 1000);
+      }
+      show('media media-' + mediaKind);
+    }
+
+    function onMediaControl(message) {
+      if (!mediaKind || mediaKind === 'image') return;
+      if (message.action === 'play') playMedia();
+      else if (message.action === 'pause') mediaVideo.pause();
+      else if (message.action === 'seek') mediaVideo.currentTime = (message.position || 0) / 1000;
+      mediaStatus();
+    }
+
+    function onMessage(message) {
+      switch (message.type) {
+        case 'media': onMedia(message); break;
+        case 'media-control': onMediaControl(message); break;
+        case 'media-stop':
+          stopMedia();
+          showIdle();
+          break;
+        case 'offer':
+          stopMedia();
+          onOffer(message.sdp).catch((error) => {
+            console.error(error);
+            stopPeer();
+            send({ type: 'error', message: String(error) });
+          });
+          break;
+        case 'candidate': onCandidate(message); break;
+        case 'bye':
+          stopPeer();
+          pendingCandidates = [];
+          break;
+      }
+    }
+
+    // ---- Cast mode: the TV's Cast runtime carries the signaling. ----
+
+    function startCast() {
+      const script = document.createElement('script');
+      script.src = CAF_URL;
+      script.onload = () => {
+        const context = cast.framework.CastReceiverContext.getInstance();
+        let senderId = null;
+        send = (message) => { if (senderId) context.sendCustomMessage(NAMESPACE, senderId, message); };
+
+        context.addCustomMessageListener(NAMESPACE, (event) => {
+          senderId = event.senderId;
+          onMessage(typeof event.data === 'string' ? JSON.parse(event.data) : event.data);
+        });
+        context.addEventListener(cast.framework.system.EventType.SENDER_DISCONNECTED, (event) => {
+          if (event.senderId === senderId) {
+            stopMedia();
+            stopPeer();
+          }
+        });
+        context.start({
+          customNamespaces: { [NAMESPACE]: cast.framework.system.MessageType.JSON },
+          // Nothing "plays" in the media sense while mirroring: keep the receiver from timing out.
+          disableIdleTimeout: true,
+          // No media player is used; don't load one.
+          skipPlayersLoad: true,
+        });
+      };
+      document.head.appendChild(script);
+    }
+
+    // ---- Browser mode: a WebSocket back to the phone that served this page. ----
+
+    const PING_MILLIS = 5000;
+    const SILENCE_MILLIS = 15000;
+    const RETRY_MILLIS = 2000;
+
+    function startBrowser() {
+      idleText = { status: 'Connected to your phone', hint: 'On your phone, tap Start Mirroring. Click anywhere here for full screen.' };
+      let socket = null;
+      let heardAt = 0;
+
+      function connect() {
+        show('connecting', 'Connecting to your phone…', 'Keep TV Cast open on your phone, on the same Wi-Fi as this computer.');
+        socket = new WebSocket(`ws://${location.host}/ws`);
+        socket.onopen = () => {
+          heardAt = Date.now();
+          send = (message) => { if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message)); };
+          showIdle();
+        };
+        socket.onmessage = (event) => {
+          heardAt = Date.now();
+          const message = JSON.parse(event.data);
+          if (message.type === 'busy') {
+            show('offline', 'Your phone is mirroring to another screen', 'Close the other window or tab. This page connects by itself afterwards.');
+            socket.onclose = () => setTimeout(connect, RETRY_MILLIS * 2);
+            return;
+          }
+          if (message.type !== 'pong') onMessage(message);
+        };
+        socket.onclose = () => {
+          send = () => {};
+          stopMedia();
+          stopPeer();
+          show('offline', 'Can\'t reach your phone', 'Open TV Cast on your phone, choose Computer, and keep both on the same Wi-Fi. This page reconnects by itself.');
+          setTimeout(connect, RETRY_MILLIS);
+        };
+      }
+
+      // Both ways: the phone drops a silent browser, and this page drops a silent phone.
+      setInterval(() => {
+        if (!socket || socket.readyState !== WebSocket.OPEN) return;
+        if (Date.now() - heardAt > SILENCE_MILLIS) return socket.close();
+        socket.send('{"type":"ping"}');
+      }, PING_MILLIS);
+
+      const unmute = () => {
+        if (soundButton.hidden) return;
+        for (const element of [video, mediaVideo]) {
+          element.muted = false;
+          if (element.src || element.srcObject) element.play().catch(() => {});
+        }
+        soundButton.hidden = true;
+      };
+      const fullscreenButton = document.getElementById('fullscreen');
+      const enterFullscreen = () => document.documentElement.requestFullscreen?.().catch(() => {});
+      document.onfullscreenchange = () => {
+        fullscreenButton.textContent = document.fullscreenElement ? 'Exit full screen' : 'Full screen';
+      };
+      soundButton.onclick = unmute;
+      fullscreenButton.onclick = () => (document.fullscreenElement ? document.exitFullscreen() : enterFullscreen());
+      // A click anywhere fills the screen (browsers only allow it from a click) and turns the
+      // sound on. It never leaves full screen: that's Esc or the button, so a stray click is harmless.
+      document.addEventListener('click', (event) => {
+        if (event.target.closest('button')) return;
+        unmute();
+        if (!document.fullscreenElement) enterFullscreen();
+      });
+
+      let mouseTimer = 0;
+      document.onmousemove = () => {
+        document.body.classList.remove('idle-mouse');
+        clearTimeout(mouseTimer);
+        mouseTimer = setTimeout(() => document.body.classList.add('idle-mouse'), 2500);
+      };
+
+      connect();
+    }
+
+    if (MODE === 'cast') startCast(); else startBrowser();
+  </script>
+</body>
+</html>
