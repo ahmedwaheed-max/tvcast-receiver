@@ -218,10 +218,12 @@
         const receiver = event.receiver;
         if ('jitterBufferTarget' in receiver) receiver.jitterBufferTarget = 0;
         if ('playoutDelayHint' in receiver) receiver.playoutDelayHint = 0;
-        const stream = video.srcObject || new MediaStream();
-        stream.addTrack(event.track);
+        // One stream per session, attached once; tracks join it. Attaching it again for the second
+        // track reloaded the <video>, which cancelled its play() (HiSmart TV, 2026-11-10: "The play()
+        // request was interrupted by a new load request").
+        if (!video.srcObject) video.srcObject = new MediaStream();
+        video.srcObject.addTrack(event.track);
         log('track ' + event.track.kind);
-        video.srcObject = stream;
         play(event.track.kind === 'audio');
         if (event.track.kind === 'video') show('streaming');
       };
@@ -243,10 +245,22 @@
 
     /** Plays with sound when the browser allows it; otherwise muted, with a button for sound. */
     function play(hasAudio) {
+      // Already playing (or asked to): leave it. Unmuting a muted autoplay here would make the
+      // browser pause it.
+      if (!video.paused) {
+        if (hasAudio && video.muted) soundButton.hidden = false;
+        return;
+      }
       video.muted = false;
-      video.play().catch(() => {
+      video.play().then(() => log('play() started' + (video.muted ? ' muted' : ''))).catch((error) => {
+        // A newer load or play() took over: not a failure.
+        if (error.name === 'AbortError') return log('play() interrupted: ' + error.message);
+        // Sound not allowed without a click (browsers): play muted, with the sound button.
         video.muted = true;
-        video.play().catch((error) => problem('video would not play: ' + error));
+        video.play().then(() => log('play() started muted')).catch((e) => {
+          if (e.name === 'AbortError') log('play() interrupted: ' + e.message);
+          else problem('video would not play: ' + e);
+        });
         if (hasAudio || video.srcObject?.getAudioTracks().length) soundButton.hidden = false;
       });
     }
