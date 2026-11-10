@@ -40,6 +40,7 @@
     .dot { display: inline-block; width: .6em; height: .6em; border-radius: 50%; background: #5ed35e; margin-right: .5em; vertical-align: middle; }
     body.connecting .dot { background: #d74418; animation: pulse 1s infinite alternate; }
     body.offline .dot { background: #8a8a8a; }
+    body.error .dot { background: #e5484d; }
     @keyframes pulse { from { opacity: .35; } to { opacity: 1; } }
 
     body.browser { cursor: pointer; }
@@ -107,6 +108,9 @@
     const MODE = new URLSearchParams(location.search).get('mode') || (location.protocol === 'https:' ? 'cast' : 'browser');
 
     const video = document.getElementById('screen');
+    const screenVideo = video;
+    video.addEventListener('playing', () => log(`playing ${video.videoWidth}x${video.videoHeight}`));
+    video.addEventListener('error', () => problem('video element error ' + (video.error && video.error.code)));
     const statusText = document.getElementById('status-text');
     const hint = document.getElementById('hint');
     const soundButton = document.getElementById('sound');
@@ -129,7 +133,51 @@
       show('', idleText.status, idleText.hint);
     }
 
-    function stopPeer() {
+    /**
+     * How the TV's side is going, for the phone's trail (its debug crash report keeps the steps).
+     * A [problem] is something the phone should report even though the session carries on.
+     */
+    function log(message) {
+      console.log('[tvcast]', message);
+      send({ type: 'log', message: String(message) });
+    }
+
+    function problem(message) {
+      console.warn('[tvcast]', message);
+      send({ type: 'problem', message: String(message) });
+    }
+
+    /** The codec the answer picked for video ("H264", "VP8"…): the first payload of its m=video line. */
+    function videoCodec(sdp) {
+      const media = /^m=video \S+ \S+ (\d+)/m.exec(sdp || '');
+      if (!media) return 'none';
+      const map = new RegExp('^a=rtpmap:' + media[1] + ' ([^/\\s]+)', 'm').exec(sdp);
+      return map ? map[1] : 'payload ' + media[1];
+    }
+
+    /** A few seconds after connecting: did frames arrive, and did they decode? */
+    async function reportStats(current) {
+      if (peer !== current) return;
+      try {
+        const stats = await current.getStats();
+        let video = null;
+        const codecs = {};
+        stats.forEach((r) => {
+          if (r.type === 'inbound-rtp' && r.kind === 'video') video = r;
+          if (r.type === 'codec') codecs[r.id] = r.mimeType;
+        });
+        if (!video) return problem('no incoming video stream after connecting');
+        const line = `video ${codecs[video.codecId] || '?'} ${video.frameWidth || 0}x${video.frameHeight || 0}` +
+          ` received=${video.framesReceived ?? '?'} decoded=${video.framesDecoded ?? '?'} dropped=${video.framesDropped ?? '?'}` +
+          ` decoder=${video.decoderImplementation || '?'} element=${screenVideo.videoWidth}x${screenVideo.videoHeight}`;
+        if (!video.framesDecoded) problem('frames not decoding: ' + line); else log(line);
+      } catch (error) {
+        log('stats failed: ' + error);
+      }
+    }
+
+    /** [keepMessage]: leave a failure on screen (the phone's "bye" follows its error at once). */
+    function stopPeer(keepMessage) {
       if (peer) {
         peer.ontrack = peer.onicecandidate = peer.onconnectionstatechange = null;
         peer.close();
@@ -138,7 +186,7 @@
       pendingCandidates = [];
       video.srcObject = null;
       soundButton.hidden = true;
-      showIdle();
+      if (!keepMessage) showIdle();
     }
 
     async function onOffer(sdp) {
@@ -147,13 +195,23 @@
       stopPeer();
       pendingCandidates = early;
       show('connecting', 'Connecting…');
+      if (typeof RTCPeerConnection === 'undefined') throw new Error('this TV has no WebRTC (RTCPeerConnection is missing)');
+      const decoders = (window.RTCRtpReceiver && RTCRtpReceiver.getCapabilities && RTCRtpReceiver.getCapabilities('video')) || { codecs: [] };
+      log(`offer received; decoders ${[...new Set(decoders.codecs.map((c) => c.mimeType.replace('video/', '')))].join(',') || 'unknown'}; ${navigator.userAgent}`);
       // Same Wi-Fi only: host candidates are enough, so no STUN/TURN servers.
-      peer = new RTCPeerConnection({ iceServers: [] });
+      const current = peer = new RTCPeerConnection({ iceServers: [] });
+      const gathered = [];
 
       peer.onicecandidate = (event) => {
-        if (!event.candidate) return;
-        send({ type: 'candidate', candidate: event.candidate.candidate, sdpMid: event.candidate.sdpMid, sdpMLineIndex: event.candidate.sdpMLineIndex });
+        if (!event.candidate) {
+          log('candidates gathered: ' + (gathered.join(', ') || 'none'));
+          return;
+        }
+        const c = event.candidate;
+        gathered.push(`${c.type || '?'} ${c.protocol || ''} ${(c.address || '').endsWith('.local') ? 'mdns' : (c.address || '?')}`);
+        send({ type: 'candidate', candidate: c.candidate, sdpMid: c.sdpMid, sdpMLineIndex: c.sdpMLineIndex });
       };
+      peer.oniceconnectionstatechange = () => { if (peer === current) log('ice ' + current.iceConnectionState); };
 
       peer.ontrack = (event) => {
         // Mirroring wants the newest frame, not a smooth buffer: ask for minimal playout delay.
@@ -162,21 +220,25 @@
         if ('playoutDelayHint' in receiver) receiver.playoutDelayHint = 0;
         const stream = video.srcObject || new MediaStream();
         stream.addTrack(event.track);
+        log('track ' + event.track.kind);
         video.srcObject = stream;
         play(event.track.kind === 'audio');
         if (event.track.kind === 'video') show('streaming');
       };
 
       peer.onconnectionstatechange = () => {
-        if (!peer) return;
-        if (peer.connectionState === 'failed' || peer.connectionState === 'closed') stopPeer();
+        if (peer !== current) return;
+        log('connection ' + current.connectionState);
+        if (current.connectionState === 'connected') setTimeout(() => reportStats(current), 4000);
+        if (current.connectionState === 'failed' || current.connectionState === 'closed') stopPeer();
       };
 
       await peer.setRemoteDescription({ type: 'offer', sdp });
-      for (const candidate of pendingCandidates) await peer.addIceCandidate(candidate).catch(() => {});
+      for (const candidate of pendingCandidates) await peer.addIceCandidate(candidate).catch((e) => log('candidate refused: ' + e));
       pendingCandidates = [];
       await peer.setLocalDescription(await peer.createAnswer());
       send({ type: 'answer', sdp: peer.localDescription.sdp });
+      log('answer sent; video ' + videoCodec(peer.localDescription.sdp));
     }
 
     /** Plays with sound when the browser allows it; otherwise muted, with a button for sound. */
@@ -184,7 +246,7 @@
       video.muted = false;
       video.play().catch(() => {
         video.muted = true;
-        video.play().catch(() => {});
+        video.play().catch((error) => problem('video would not play: ' + error));
         if (hasAudio || video.srcObject?.getAudioTracks().length) soundButton.hidden = false;
       });
     }
@@ -195,7 +257,7 @@
         pendingCandidates.push(candidate);
         return;
       }
-      await peer.addIceCandidate(candidate).catch(() => {});
+      await peer.addIceCandidate(candidate).catch((e) => log('candidate refused: ' + e));
     }
 
     // ---- Media mode: a file the phone serves, played here. ----
@@ -288,12 +350,14 @@
           onOffer(message.sdp).catch((error) => {
             console.error(error);
             stopPeer();
+            // On the TV too: whoever is in front of it sees why.
+            show('error', "Couldn't start mirroring", String(error));
             send({ type: 'error', message: String(error) });
           });
           break;
         case 'candidate': onCandidate(message); break;
         case 'bye':
-          stopPeer();
+          stopPeer(document.body.classList.contains('error'));
           pendingCandidates = [];
           break;
       }
