@@ -225,6 +225,46 @@
       }
     }
 
+    /**
+     * The first seconds of a codec: frames decoding → report the numbers (and check the picture);
+     * frames arriving but none decoding → ask the phone for its next codec. A HiSmart Android TV
+     * (CrKey 1.56, 2026-11-11) received H.264 and its hardware decoder dropped every frame (0x0);
+     * Chrome's software VP8 / VP9 decoders always exist, H.264's often don't on Cast.
+     */
+    function watchDecoding(current, codec) {
+      let base = null;
+      let checks = 0;
+      const timer = setInterval(async () => {
+        if (peer !== current) return clearInterval(timer);
+        const v = await videoStats(current).catch(() => null);
+        if (!v) return;
+        if (!base) { base = v; return; }
+        checks++;
+        const received = v.received - base.received;
+        const decoded = v.decoded - base.decoded;
+        if (decoded > 0 || (v.decoded > 0 && base.decoded > 0)) {
+          clearInterval(timer);
+          setTimeout(() => reportStats(current), 2000);
+        } else if (received >= 3 || checks >= 8) {
+          clearInterval(timer);
+          if (received === 0) return problem('no video frames arriving: ' + describe(v));
+          log(`${codec} not decoding (${received} received, 0 decoded); asking the phone for another codec`);
+          send({ type: 'decode-failed', codec });
+        }
+      }, 1000);
+    }
+
+    /** The phone switches codec on the same connection: answer it on the same peer. */
+    async function onRenegotiate(sdp) {
+      const current = peer;
+      await current.setRemoteDescription({ type: 'offer', sdp });
+      await current.setLocalDescription(await current.createAnswer());
+      send({ type: 'answer', sdp: current.localDescription.sdp });
+      const codec = videoCodec(current.localDescription.sdp);
+      log('answer sent (codec switch); video ' + codec);
+      watchDecoding(current, codec);
+    }
+
     /** Debug builds of the app ask for it with the offer: the numbers on the TV, every 2 s. */
     const diag = document.getElementById('diag');
     let diagTimer = 0;
@@ -303,7 +343,7 @@
       peer.onconnectionstatechange = () => {
         if (peer !== current) return;
         log('connection ' + current.connectionState);
-        if (current.connectionState === 'connected') setTimeout(() => reportStats(current), 4000);
+        if (current.connectionState === 'connected') watchDecoding(current, videoCodec(current.localDescription && current.localDescription.sdp));
         if (current.connectionState === 'failed' || current.connectionState === 'closed') stopPeer();
       };
 
@@ -432,6 +472,11 @@
           showIdle();
           break;
         case 'offer':
+          // The same session, another codec (the last one didn't decode here).
+          if (message.renegotiate && peer) {
+            onRenegotiate(message.sdp).catch((error) => problem('codec switch failed: ' + error));
+            break;
+          }
           stopMedia();
           onOffer(message.sdp, message.debug === true).catch((error) => {
             console.error(error);
