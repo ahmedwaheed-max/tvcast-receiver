@@ -109,6 +109,12 @@
     'use strict';
 
     const NAMESPACE = 'urn:x-cast:tvcast.mirror';
+    /**
+     * Which copy of this page the TV is running: GitHub Pages lets it keep one for 10 minutes
+     * (max-age=600), so a test right after a push can run the previous one (2026-11-11). Bump it
+     * with every change; it is in the phone's report and the debug stats box.
+     */
+    const PAGE_VERSION = '2026-11-11.3 codec-fallback';
     const CAF_URL = 'https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js';
     const MODE = new URLSearchParams(location.search).get('mode') || (location.protocol === 'https:' ? 'cast' : 'browser');
 
@@ -276,7 +282,7 @@
         const fps = v && last ? Math.round((v.decoded - last.decoded) / 2) : '-';
         last = v;
         diag.textContent = [
-          `TV Cast debug   ice ${current.iceConnectionState}   connection ${current.connectionState}`,
+          `TV Cast debug   page ${PAGE_VERSION}   ice ${current.iceConnectionState}   connection ${current.connectionState}`,
           v ? `${v.codec} ${v.width}x${v.height}   ${fps} fps decoded   decoder ${v.decoder}` : 'no video stream yet',
           v ? `frames received ${v.received}   decoded ${v.decoded}   dropped ${v.dropped}` : '',
           `<video> ${screenVideo.videoWidth}x${screenVideo.videoHeight}   ready ${screenVideo.readyState}   ${screenVideo.paused ? 'paused' : 'playing'}   picture ${pictureLevel()}`,
@@ -308,7 +314,7 @@
       show('connecting', 'Connecting…');
       if (typeof RTCPeerConnection === 'undefined') throw new Error('this TV has no WebRTC (RTCPeerConnection is missing)');
       const decoders = (window.RTCRtpReceiver && RTCRtpReceiver.getCapabilities && RTCRtpReceiver.getCapabilities('video')) || { codecs: [] };
-      log(`offer received; decoders ${[...new Set(decoders.codecs.map((c) => c.mimeType.replace('video/', '')))].join(',') || 'unknown'}; ${navigator.userAgent}`);
+      log(`offer received; page ${PAGE_VERSION}; decoders ${[...new Set(decoders.codecs.map((c) => c.mimeType.replace('video/', '')))].join(',') || 'unknown'}; ${navigator.userAgent}`);
       // Same Wi-Fi only: host candidates are enough, so no STUN/TURN servers.
       const current = peer = new RTCPeerConnection({ iceServers: [] });
       if (debug) startDiagnostics(current);
