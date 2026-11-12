@@ -114,7 +114,7 @@
      * (max-age=600), so a test right after a push can run the previous one (2026-11-11). Bump it
      * with every change; it is in the phone's report and the debug stats box.
      */
-    const PAGE_VERSION = '2026-11-11.3 codec-fallback';
+    const PAGE_VERSION = '2026-11-12.1 closes-when-unused';
     const CAF_URL = 'https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js';
     const MODE = new URLSearchParams(location.search).get('mode') || (location.protocol === 'https:' ? 'cast' : 'browser');
 
@@ -502,28 +502,98 @@
 
     // ---- Cast mode: the TV's Cast runtime carries the signaling. ----
 
+    /*
+     * The page closes itself when nobody uses it (owner, 2026-11-12: a TV turned back on showing
+     * "Ready to mirror"). CAF's own idle timeout has to stay off (mirroring isn't "playing" to CAF and
+     * would be cut after 5 minutes), and an Android TV wakes from standby on whatever was on screen.
+     * So: closed a little after the last phone leaves (a Wi-Fi blip or the phone's Cast SDK
+     * reconnecting is given time), when the TV goes to standby or hides the page with nothing on
+     * screen, and after a long time with nothing on screen. Closing ends the phone's TV session.
+     */
+    const NO_PHONE_MILLIS = 15000;
+    const IDLE_CLOSE_MILLIS = 10 * 60 * 1000;
+    const IDLE_CHECK_MILLIS = 30000;
+
+    /** Something on screen: a mirroring / camera stream, or a cast photo, video or song. */
+    function busy() { return !!peer || !!mediaKind; }
+
     function startCast() {
       const script = document.createElement('script');
       script.src = CAF_URL;
       script.onload = () => {
+        const EventType = cast.framework.system.EventType;
         const context = cast.framework.CastReceiverContext.getInstance();
         let senderId = null;
-        send = (message) => { if (senderId) context.sendCustomMessage(NAMESPACE, senderId, message); };
+        // A phone that dropped off mid-stream can't be written to: don't let that throw into the page.
+        send = (message) => {
+          if (!senderId) return;
+          try { context.sendCustomMessage(NAMESPACE, senderId, message); } catch (e) { console.warn('send failed', e); }
+        };
+
+        let noPhoneTimer = null;
+        let idleSince = Date.now();
+        let hidden = false; // the TV is in standby, or showing something else
+
+        let closing = false;
+        function close(why) {
+          if (closing) return;
+          closing = true;
+          console.log('closing: ' + why);
+          stopMedia();
+          stopPeer();
+          context.stop();
+        }
 
         context.addCustomMessageListener(NAMESPACE, (event) => {
           senderId = event.senderId;
           onMessage(typeof event.data === 'string' ? JSON.parse(event.data) : event.data);
         });
-        context.addEventListener(cast.framework.system.EventType.SENDER_DISCONNECTED, (event) => {
-          if (event.senderId === senderId) {
-            stopMedia();
-            stopPeer();
-          }
+        context.addEventListener(EventType.SENDER_CONNECTED, (event) => {
+          clearTimeout(noPhoneTimer);
+          noPhoneTimer = null;
+          if (!senderId || context.getSenders().length === 1) senderId = event.senderId;
         });
+        context.addEventListener(EventType.SENDER_DISCONNECTED, (event) => {
+          if (context.getSenders().length > 0) {
+            // Another phone is still here: only what the one that left had going ends.
+            if (event.senderId === senderId) {
+              stopMedia();
+              stopPeer();
+            }
+            return;
+          }
+          // The last phone left. Its connection may come back in a moment: what is on screen stays
+          // meanwhile (the stream itself is phone-to-TV and may still be running).
+          clearTimeout(noPhoneTimer);
+          noPhoneTimer = setTimeout(() => {
+            if (context.getSenders().length === 0) close('no phone connected');
+          }, NO_PHONE_MILLIS);
+        });
+        const onHidden = (isHidden) => {
+          hidden = isHidden;
+          if (hidden && !busy()) close('TV in standby or showing something else');
+        };
+        context.addEventListener(EventType.STANDBY_CHANGED, (event) => onHidden(!!event.isStandby));
+        context.addEventListener(EventType.VISIBILITY_CHANGED, (event) => onHidden(event.isVisible === false));
+        // Timers stop while a TV sleeps and catch up when it wakes: a page left idle closes then.
+        setInterval(() => {
+          if (busy()) {
+            idleSince = Date.now();
+          } else if (hidden) {
+            close('TV in standby or showing something else');
+          } else if (Date.now() - idleSince > IDLE_CLOSE_MILLIS) {
+            close('nothing on screen for ' + Math.round(IDLE_CLOSE_MILLIS / 60000) + ' minutes');
+          }
+        }, IDLE_CHECK_MILLIS);
+
         context.start({
           customNamespaces: { [NAMESPACE]: cast.framework.system.MessageType.JSON },
-          // Nothing "plays" in the media sense while mirroring: keep the receiver from timing out.
+          // Nothing "plays" in the media sense while mirroring: keep CAF from closing the page
+          // after 5 minutes. The page closes itself when unused instead (see above).
           disableIdleTimeout: true,
+          // A busy or weak Wi-Fi can hold the phone's heartbeat up for a while: CAF's 10 s default
+          // dropped the phone, and with it the stream (owner, 2026-11-12: "disconnects on slow internet").
+          maxInactivity: 30,
           // No media player is used; don't load one.
           skipPlayersLoad: true,
         });
