@@ -15,7 +15,9 @@
   Media mode (Videos / Photos / Music in the app): a `media` message names a file the phone
   serves itself (`/media/<token>`, with ranges); this page shows it full screen — video, photo,
   or a song's cover art and title — follows `media-control` (play / pause / seek) and reports
-  `media-status` back every second, so the phone's timeline and timer follow the TV.
+  `media-status` back every second, so the phone's timeline and timer follow the TV. A file that
+  doesn't get going (no 'playing' in 10 s, or a video with no decoded frame after 3 s of play)
+  is reported `failed` with a `reason`, and the phone stops the cast (QA 2026-11-17).
 -->
 <html lang="en">
 <head>
@@ -114,7 +116,7 @@
      * (max-age=600), so a test right after a push can run the previous one (2026-11-11). Bump it
      * with every change; it is in the phone's report and the debug stats box.
      */
-    const PAGE_VERSION = '2026-11-12.1 closes-when-unused';
+    const PAGE_VERSION = '2026-11-17.1 media-checks';
     const CAF_URL = 'https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js';
     const MODE = new URLSearchParams(location.search).get('mode') || (location.protocol === 'https:' ? 'cast' : 'browser');
 
@@ -402,23 +404,98 @@
     let mediaKind = null;
     let mediaTimer = 0;
 
+    /*
+     * Whether the file gets going (QA 2026-11-17: a HiSmart TV took a video and showed nothing
+     * while the phone said "Playing"). A video or song must reach 'playing' within
+     * MEDIA_START_MILLIS (not counting time the phone holds it paused or this page is out of
+     * sight); a video must then have decoded frames once it has run PICTURE_AFTER_SECONDS, since a
+     * TV whose decoder gives nothing back can still run the clock on the sound. Either failing
+     * reports `failed` with a reason (in the phone's trail), and the phone stops the cast. The
+     * phone gives up by itself after 12 s too, for a page that says nothing at all.
+     */
+    const MEDIA_START_MILLIS = 10000;
+    const PICTURE_AFTER_SECONDS = 3;
+    const MEDIA_ERRORS = ['', 'aborted', 'network error', 'decode error', 'format not supported'];
+    let mediaCheck = null;
+
+    /** Frames the media video has decoded so far, or null where the browser can't say. */
+    function decodedFrames() {
+      if (typeof mediaVideo.getVideoPlaybackQuality === 'function') return mediaVideo.getVideoPlaybackQuality().totalVideoFrames;
+      return typeof mediaVideo.webkitDecodedFrameCount === 'number' ? mediaVideo.webkitDecodedFrameCount : null;
+    }
+
+    function buffered() {
+      const ranges = mediaVideo.buffered;
+      return ranges.length ? `buffered to ${ranges.end(ranges.length - 1).toFixed(1)} s` : 'nothing buffered';
+    }
+
     function mediaStatus(extra) {
       if (!mediaKind) return;
       const timed = mediaKind !== 'image';
       send(Object.assign({
         type: 'media-status',
-        playing: timed && !mediaVideo.paused && !mediaVideo.ended,
+        // Only while it can really move (HAVE_FUTURE_DATA): a TV whose decoder gave nothing said
+        // "playing" from the moment play() was called, and the phone followed it.
+        playing: timed && !mediaVideo.paused && !mediaVideo.ended && mediaVideo.readyState >= 3,
         position: timed ? Math.round(mediaVideo.currentTime * 1000) : 0,
         duration: timed && isFinite(mediaVideo.duration) ? Math.round(mediaVideo.duration * 1000) : 0,
         ended: timed && mediaVideo.ended,
+        // A browser tab out of sight may hold a video back: the phone doesn't count that time.
+        hidden: document.hidden,
         failed: false,
       }, extra || {}));
+    }
+
+    /** The file can't be shown (once per file): the phone stops the cast and keeps [why] in its trail. */
+    function mediaFailed(why) {
+      if (!mediaKind || !mediaCheck || mediaCheck.failed) return;
+      mediaCheck.failed = true;
+      problem('media: ' + why);
+      send({ type: 'media-status', failed: true, reason: String(why) });
+    }
+
+    function mediaStarted() {
+      const check = mediaCheck;
+      if (!check || check.started) return;
+      check.started = true;
+      check.startedAt = mediaVideo.currentTime;
+      log(`media: playing ${mediaVideo.videoWidth}x${mediaVideo.videoHeight} from ${mediaVideo.currentTime.toFixed(1)} s`);
+    }
+
+    /** Once a second while a video or song is on (see MEDIA_START_MILLIS). */
+    function checkMedia() {
+      const check = mediaCheck;
+      if (!check || check.failed || mediaKind === 'image') return;
+      const now = Date.now();
+      if (check.held || document.hidden) {
+        check.since = now;
+        return;
+      }
+      // 'playing' can be missed on some players: time moving on its own counts too.
+      if (!check.started && !mediaVideo.paused && mediaVideo.readyState >= 3 && mediaVideo.currentTime > check.from + 0.5) mediaStarted();
+      if (!check.started) {
+        if (now - check.since < MEDIA_START_MILLIS) return;
+        return mediaFailed(`didn't start in ${MEDIA_START_MILLIS / 1000} s (readyState ${mediaVideo.readyState}, ` +
+          `networkState ${mediaVideo.networkState}, ${mediaVideo.videoWidth}x${mediaVideo.videoHeight}, ` +
+          `at ${mediaVideo.currentTime.toFixed(1)} s, ${buffered()}, ${mediaVideo.paused ? 'paused' : 'not paused'})`);
+      }
+      if (mediaKind !== 'video' || check.pictureChecked || !mediaVideo.videoWidth) return;
+      if (mediaVideo.paused || mediaVideo.currentTime - check.startedAt < PICTURE_AFTER_SECONDS) return;
+      check.pictureChecked = true;
+      const frames = decodedFrames();
+      if (frames === 0) {
+        mediaFailed(`no picture: ${mediaVideo.videoWidth}x${mediaVideo.videoHeight} ran ${PICTURE_AFTER_SECONDS} s with 0 frames decoded`);
+      } else {
+        log(`media: picture ok, ${frames === null ? 'frame count unknown' : frames + ' frames decoded'}`);
+      }
     }
 
     function stopMedia() {
       clearInterval(mediaTimer);
       mediaKind = null;
+      mediaCheck = null;
       mediaVideo.onerror = mediaImage.onerror = null;
+      mediaVideo.onplaying = mediaVideo.onwaiting = mediaVideo.onstalled = null;
       mediaVideo.pause();
       mediaVideo.removeAttribute('src');
       mediaVideo.load();
@@ -439,33 +516,64 @@
       stopPeer();
       stopMedia();
       mediaKind = message.kind;
-      const failed = () => send({ type: 'media-status', failed: true });
+      mediaCheck = { since: Date.now(), from: (message.start || 0) / 1000, started: false, startedAt: 0, held: false, pictureChecked: false, failed: false };
+      log(`media: ${mediaKind} ${message.mime || ''} from ${((message.start || 0) / 1000).toFixed(1)} s`);
       if (mediaKind === 'image') {
-        mediaImage.onload = () => mediaStatus();
-        mediaImage.onerror = failed;
+        mediaImage.onload = () => {
+          log(`media: image ${mediaImage.naturalWidth}x${mediaImage.naturalHeight}`);
+          mediaStatus();
+        };
+        mediaImage.onerror = () => mediaFailed("the image didn't load");
         mediaImage.src = message.url;
       } else {
         mediaTitle.textContent = message.title || '';
         mediaArtist.textContent = message.artist || '';
         mediaArt.src = message.art || 'logo.png';
-        mediaVideo.onerror = failed;
+        mediaVideo.onerror = () => {
+          const error = mediaVideo.error;
+          mediaFailed(`${error ? MEDIA_ERRORS[error.code] || 'error ' + error.code : 'error'}${error && error.message ? ': ' + error.message : ''}`);
+        };
         mediaVideo.onloadedmetadata = () => {
+          log(`media: ${mediaVideo.videoWidth}x${mediaVideo.videoHeight}, ${isFinite(mediaVideo.duration) ? mediaVideo.duration.toFixed(1) + ' s' : 'live'}`);
           if (message.start) mediaVideo.currentTime = message.start / 1000;
           mediaStatus();
         };
-        mediaVideo.onplay = mediaVideo.onpause = mediaVideo.onended = mediaVideo.onseeked = () => mediaStatus();
+        mediaVideo.onplaying = () => {
+          mediaStarted();
+          mediaStatus();
+        };
+        mediaVideo.onseeked = () => {
+          // A seek's own jump isn't playing time (the picture check counts from here).
+          if (mediaCheck && mediaCheck.started) mediaCheck.startedAt = mediaVideo.currentTime;
+          mediaStatus();
+        };
+        mediaVideo.onplay = mediaVideo.onpause = mediaVideo.onended = mediaVideo.onwaiting = mediaVideo.onstalled = () => mediaStatus();
         mediaVideo.src = message.url;
         playMedia();
-        mediaTimer = setInterval(mediaStatus, 1000);
+        mediaTimer = setInterval(() => {
+          checkMedia();
+          mediaStatus();
+        }, 1000);
       }
       show('media media-' + mediaKind);
     }
 
     function onMediaControl(message) {
       if (!mediaKind || mediaKind === 'image') return;
-      if (message.action === 'play') playMedia();
-      else if (message.action === 'pause') mediaVideo.pause();
-      else if (message.action === 'seek') mediaVideo.currentTime = (message.position || 0) / 1000;
+      const check = mediaCheck;
+      if (message.action === 'play') {
+        if (check) {
+          check.held = false;
+          if (!check.started) check.since = Date.now();
+        }
+        playMedia();
+      } else if (message.action === 'pause') {
+        if (check) check.held = true;
+        mediaVideo.pause();
+      } else if (message.action === 'seek') {
+        if (check && !check.started) check.since = Date.now();
+        mediaVideo.currentTime = (message.position || 0) / 1000;
+      }
       mediaStatus();
     }
 
